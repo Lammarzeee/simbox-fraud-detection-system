@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Request, Response
 import httpx
 import asyncio
 from datetime import datetime
@@ -58,6 +58,28 @@ def read_live_cdrs():
     return cdrs
 
 
+# ✅ NEW: Direct Ingest Endpoint for Streamlit/Dummy server
+@app.post("/ingest_cdr")
+async def ingest_cdr(request: Request):
+    """Receive raw CDR from client, forward to Fraud API, log result."""
+    cdr = await request.json()
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.post(fraud_api_url, json=cdr, timeout=10.0)
+            fraud_response = resp.json()
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            action_log.append(
+                f"[{ts}] 📥 Ingested CDR {cdr.get('call_id', 'unknown')} → Fraud API: {fraud_response.get('status', 'N/A')}"
+            )
+            return fraud_response
+        except Exception as e:
+            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            action_log.append(
+                f"[{ts}] ❌ Failed to process CDR {cdr.get('call_id', 'unknown')} | Error: {e}"
+            )
+            return {"status": "❌ Error forwarding to Fraud API", "detail": str(e)}
+
+
 @app.get("/send-cdrs")
 async def send_cdrs():
     results = []
@@ -69,7 +91,6 @@ async def send_cdrs():
     # Ensure 'destination' exists in each CDR
     for cdr in cdr_samples:
         if "destination" not in cdr:
-            # Use 'callee' if available, else fallback to 'caller'
             cdr["destination"] = cdr.get("callee") or cdr.get("caller") or "UNKNOWN"
 
     async with httpx.AsyncClient() as client:
