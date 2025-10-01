@@ -3,6 +3,7 @@ import pandas as pd
 import requests
 import plotly.express as px
 from streamlit_autorefresh import st_autorefresh
+import matplotlib.pyplot as plt
 
 # -------------------
 # API Endpoints
@@ -11,6 +12,7 @@ FRAUD_API_URL = "http://127.0.0.1:8001/process_cdr"
 FRAUD_LOGS_URL = "http://127.0.0.1:8001/logs"
 TELCO_LOGS_URL = "http://127.0.0.1:8002/logs"
 TELCO_INGEST_URL = "http://127.0.0.1:8002/ingest_cdr"
+LATEST_EXPLAIN_URL = "http://127.0.0.1:8001/latest_explanations"
 
 # -------------------
 # Streamlit Config
@@ -87,7 +89,6 @@ if uploaded_file is not None:
     predictions = []
     with st.spinner("⚡ Analyzing uploaded CDRs..."):
         for i, row in df.iterrows():
-            # ✅ Map row to API schema to avoid 422 errors
             cdr = {
                 "call_id": str(i),
                 "caller": str(row.get("phone number", row.get("caller", "unknown"))),
@@ -100,6 +101,8 @@ if uploaded_file is not None:
                 "imsi": "IMSI987654321",
                 "timestamp": "2025-09-25T12:30:00",
                 "isFraud": int(row.get("isFraud", 0)),
+                "num_unique_contacts": 1,
+                "imei_reuse": 0,
             }
 
             try:
@@ -112,7 +115,6 @@ if uploaded_file is not None:
                 result = "Error"
             predictions.append(result)
 
-    # --- Fallback if all API calls failed ---
     if all("Error" in str(p) for p in predictions) and "isFraud" in df.columns:
         st.warning("⚠️ API rejected CDRs. Falling back to `isFraud` column from CSV.")
         predictions = df["isFraud"].apply(lambda x: "Fraudulent Call Detected 🚨" if x else "Legitimate Call ✅")
@@ -134,14 +136,14 @@ if uploaded_file is not None:
 
     st.markdown("---")
 
-    # Charts & Tabs
+    # Charts
     tab1, tab2 = st.tabs(["📊 Fraud vs Legit", "⏱️ Duration Histogram"])
     with tab1:
         chart_df = pd.DataFrame({"Type": ["Fraudulent", "Legitimate"], "Count": [fraud_count, legit_count]})
         fig = px.pie(chart_df, names="Type", values="Count",
                      color_discrete_map={"Fraudulent":"red", "Legitimate":"#2ecc71"},
                      title="Fraud vs Legit Call Distribution")
-        st.plotly_chart(fig, width="stretch")
+        st.plotly_chart(fig, use_container_width=True)
     with tab2:
         duration_col = "duration" if "duration" in df.columns else "Day Mins" if "Day Mins" in df.columns else None
         if duration_col:
@@ -149,7 +151,7 @@ if uploaded_file is not None:
                                title=f"{duration_col} Distribution",
                                color_discrete_sequence=["#3498db"],
                                nbins=20)
-            st.plotly_chart(fig, width="stretch")
+            st.plotly_chart(fig, use_container_width=True)
 
     # Detailed table
     st.subheader("📋 Detailed Results")
@@ -163,7 +165,7 @@ st.subheader("📝 Live Logs from Backends")
 
 st_autorefresh(interval=15 * 1000, key="logs_refresh")
 
-log_tab, telco_tab = st.tabs(["Fraud API Logs", "Telco Backend Logs"])
+log_tab, telco_tab, xai_tab = st.tabs(["Fraud API Logs", "Telco Backend Logs", "🔍 Explainability"])
 
 with log_tab:
     try:
@@ -178,3 +180,57 @@ with telco_tab:
         st.text_area("Telco Backend Logs", telco_text, height=300, key="telco_logs_area")
     except:
         st.warning("⚠️ Unable to fetch telco logs.")
+
+# -------------------
+# Explainability Tab
+# -------------------
+with xai_tab:
+    st.subheader("Explainable AI (XAI) for Latest Fraud Predictions")
+
+    try:
+        exp_resp = requests.get(LATEST_EXPLAIN_URL, timeout=5).json()
+
+        if "latest_cdr" in exp_resp:
+            st.write("### 📋 Latest CDR Features")
+            st.json(exp_resp["latest_cdr"])
+
+            # SHAP chart
+            st.write("### 🔎 SHAP Feature Contributions")
+            shap_vals = exp_resp["shap"]["values"]
+            feature_names = list(exp_resp["latest_cdr"].keys())
+            shap_series = pd.Series(shap_vals, index=feature_names)
+
+            plt.figure(figsize=(6,3))
+            shap_series.plot(
+                kind="bar",
+                color=["red" if v < 0 else "green" for v in shap_vals]
+            )
+            plt.ylabel("Impact on Fraud Prediction")
+            plt.title("SHAP Feature Importance (Local)")
+            st.pyplot(plt)
+
+            # Human-readable SHAP explanation
+            st.write("**Key Drivers from SHAP:**")
+            for feat, val in shap_series.sort_values(key=abs, ascending=False).items():
+                direction = "increases" if val > 0 else "decreases"
+                st.markdown(f"- `{feat}` {direction} fraud likelihood (weight: {val:.3f})")
+
+            # LIME explanation
+            st.write("### 📊 LIME Explanation")
+            lime_expl = exp_resp.get("lime", [])
+            if lime_expl:
+                lime_df = pd.DataFrame(lime_expl, columns=["Feature / Rule", "Contribution"])
+                st.dataframe(lime_df, use_container_width=True)
+                for feat, contrib in lime_expl:
+                    direction = "supports fraud" if contrib > 0 else "supports legitimate"
+                    st.markdown(f"- `{feat}` → {direction} (weight: {contrib:.3f})")
+
+            # Natural language summary
+            if "summary" in exp_resp:
+                st.write("### 📝 Natural Language Summary")
+                st.info(exp_resp["summary"])
+
+        else:
+            st.info("⚠️ No CDR processed yet for explanations.")
+    except Exception as e:
+        st.warning(f"⚠️ Could not fetch explanations: {e}")
